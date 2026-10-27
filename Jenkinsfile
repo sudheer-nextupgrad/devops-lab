@@ -16,6 +16,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+                sh 'rm -f .prev_image'
             }
         }
 
@@ -34,6 +35,9 @@ pipeline {
         stage('Deploy') {
             steps {
                 sh '''
+                    PREV=$(docker inspect -f '{{.Config.Image}}' ${CONTAINER} 2>/dev/null || true)
+                    echo "previous image: ${PREV:-none}"
+                    echo "${PREV}" > .prev_image
                     docker rm -f ${CONTAINER} || true
                     docker run -d --name ${CONTAINER} -p ${PORT}:5000 --restart unless-stopped ${IMAGE}:${BUILD_NUMBER}
                 '''
@@ -49,7 +53,6 @@ pipeline {
                         if [ "$STATUS" = "healthy" ]; then exit 0; fi
                         sleep 5
                     done
-                    docker logs ${CONTAINER}
                     exit 1
                 '''
             }
@@ -57,7 +60,31 @@ pipeline {
     }
 
     post {
-        success { echo "Build #${BUILD_NUMBER} deployed. App live on port ${PORT}." }
-        failure { echo "Build #${BUILD_NUMBER} failed. Console output dekho." }
+        success {
+            echo "Build #${BUILD_NUMBER} deployed. App live on port ${PORT}."
+            sh '''
+                docker images ${IMAGE} --format '{{.Tag}}' | grep -E '^[0-9]+$' | sort -nr | tail -n +6 \
+                  | xargs -r -I{} docker rmi ${IMAGE}:{} || true
+            '''
+        }
+        failure {
+            echo "Build #${BUILD_NUMBER} failed."
+            sh '''
+                if [ ! -f .prev_image ]; then
+                    echo "Failed before deploy, running app untouched."
+                    exit 0
+                fi
+                PREV=$(cat .prev_image)
+                echo "--- failed container logs ---"
+                docker logs --tail 30 ${CONTAINER} || true
+                docker rm -f ${CONTAINER} || true
+                if [ -n "$PREV" ]; then
+                    echo "ROLLBACK to $PREV"
+                    docker run -d --name ${CONTAINER} -p ${PORT}:5000 --restart unless-stopped $PREV
+                else
+                    echo "No previous version to roll back to."
+                fi
+            '''
+        }
     }
 }
